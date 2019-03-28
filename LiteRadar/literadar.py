@@ -27,6 +27,8 @@ import dex_parser
 import hashlib
 import zipfile
 import json
+from multiprocessing import Lock, Process, Manager
+import time
 
 
 class LibRadarLite(object):
@@ -159,13 +161,15 @@ class LibRadarLite(object):
         for k in range(len(dex_class_def_obj.directMethods)):
             current_method_index = last_method_index + dex_class_def_obj.directMethods[k].methodIdx
             last_method_index = current_method_index
-            self.get_api_list(dex_obj, dex_class_def_obj.directMethods[k], api_list=api_list, permission_list=permission_list)
+            self.get_api_list(dex_obj, dex_class_def_obj.directMethods[k], api_list=api_list,
+                              permission_list=permission_list)
         # virtual methods
         last_method_index = 0
         for k in range(len(dex_class_def_obj.virtualMethods)):
             current_method_index = last_method_index + dex_class_def_obj.virtualMethods[k].methodIdx
             last_method_index = current_method_index
-            self.get_api_list(dex_obj, dex_class_def_obj.virtualMethods[k], api_list=api_list, permission_list=permission_list)
+            self.get_api_list(dex_obj, dex_class_def_obj.virtualMethods[k], api_list=api_list,
+                              permission_list=permission_list)
         # Use sort to pass the tree construction stage.
         # In this case, we could only use a stack to create the package features.
         api_list.sort()
@@ -175,7 +179,40 @@ class LibRadarLite(object):
             pass
         return len(api_list), class_sha256.hexdigest(), class_sha256.hexdigest(), sorted(list(permission_list))
 
-    def extract_dex(self):
+    def extract_dex(self, dex_name, return_data, lock):
+        _, filename = os.path.split(dex_name)
+        print("Processing : " + filename + "...")
+        current_dex = dex_parser.DexFile(dex_name)
+        self.dex_objects.append(current_dex)
+        pass
+        for dex_class_def_obj in current_dex.dexClassDefList:
+            weight, raw_sha256, hex_sha256, permission_list = self.extract_class(dex_obj=current_dex,
+                                                                                 dex_class_def_obj=dex_class_def_obj)
+            class_name = current_dex.getDexTypeId(dex_class_def_obj.classIdx)
+            """
+            I got many \x01 here before the class name.
+                such as '\x01Lcom/vungle/publisher/inject'
+            don't know exactly but could use code below to deal with it.
+            """
+            if class_name[0] is not 'L':
+                l_index = class_name.find('L')
+                if l_index == '-1':
+                    continue
+                class_name = class_name[l_index:]
+            if IGNORE_ZERO_API_FILES and weight == 0:
+                continue
+            data = [class_name, weight, raw_sha256, permission_list]
+            return_data.append(data)
+
+        print(filename + " done.")
+
+    def prepare_dex_extraction(self):
+        start_time = time.time()
+
+        manager = Manager()
+        return_data = manager.list()
+        jobs = []
+        lock = Lock()
         for dex_name in self.dex_names:
             # Log Start
             logger.debug("Extracting %s" % dex_name)
@@ -183,25 +220,18 @@ class LibRadarLite(object):
             if not os.path.isfile(dex_name):
                 logger.error("%s is not a file" % dex_name)
                 return -1
-            # Create a Dex object for each dex file contained in the apk.
-            current_dex = dex_parser.DexFile(dex_name)
-            self.dex_objects.append(current_dex)
-            for dex_class_def_obj in current_dex.dexClassDefList:
-                weight, raw_sha256, hex_sha256, permission_list = self.extract_class(dex_obj=current_dex, dex_class_def_obj=dex_class_def_obj)
-                class_name = current_dex.getDexTypeId(dex_class_def_obj.classIdx)
-                """
-                I got many \x01 here before the class name.
-                    such as '\x01Lcom/vungle/publisher/inject'
-                don't know exactly but could use code below to deal with it.
-                """
-                if class_name[0] is not 'L':
-                    l_index = class_name.find('L')
-                    if l_index == '-1':
-                        continue
-                    class_name = class_name[l_index:]
-                if IGNORE_ZERO_API_FILES and weight == 0:
-                    continue
-                self.tree.insert(package_name=class_name, weight=weight, sha256=raw_sha256, permission_list=permission_list)
+
+            proc = Process(target=self.extract_dex, args=(dex_name, return_data, lock))
+            jobs.append(proc)
+            proc.start()
+
+        for proc in jobs:
+            proc.join()
+
+        for data in return_data:
+            self.tree.insert(package_name=data[0], weight=data[1], sha256=data[2], permission_list=data[3])
+
+        print("%s seconds" % (time.time() - start_time))
         return 0
 
     def analyse(self):
@@ -212,7 +242,7 @@ class LibRadarLite(object):
         # Step 1: Unzip APK file, only extract the dex files.
         self.unzip()
         # Step 2: Extract Dex and insert package-level info into Tree
-        self.extract_dex()
+        self.prepare_dex_extraction()
         # Step 3: post-order traverse the tree, calculate every package's sha256 value.
         self.tree.cal_sha256()
 

@@ -101,3 +101,9 @@ ENV/
 
 # mypy
 .mypy_cache/
+
+# LiteRadar files
+LiteRadar/.idea/
+LiteRadar/Data/Decompiled/
+LiteRadar/Data/lite_dataset_10.csv
+LiteRadar/log_libradar.txt
